@@ -203,6 +203,7 @@ class YuanExperts(nn.Module):
             inplace=True,
             no_moe_kernels=True,
             topk_before_softmax=True,
+            model_type='yuan'
         )
 
         if self.tp_size > 1:
@@ -308,9 +309,7 @@ class YuanRotaryEmbedding(nn.Module):
         self.register_buffer('inv_freq', inv_freq)
 
     def forward(self, x, max_seq_len, offset=0):
-        #inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
-        #freqs = einsum('i , j -> i j', seq.float(), inv_freq.to(seq.device))
         freqs = einsum('i , j -> i j', seq.float(), self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb[:, None, None, :].float()
@@ -457,8 +456,7 @@ class YuanAttention(nn.Module):
         attn_factor: float=1.0,
     ) -> torch.Tensor:
         q_len, hidden_size = hidden_states.size()
-        # bsz = attn_metadata.num_prefills + attn_metadata.num_decode_tokens
-        bsz = 1
+        bsz = attn_metadata.num_prefills + attn_metadata.num_decode_tokens
         
         positions = positions.view(bsz, -1)
         lf1_cache, lf2_cache = lf_cache
@@ -494,7 +492,6 @@ class YuanAttention(nn.Module):
         k = k.view(-1, self.num_heads * self.attn_head_size)
         
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        #attn_output = torch.load('../h.bin', map_location=attn_output.device)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -620,12 +617,8 @@ class YuanModel(nn.Module):
         lf_caches: List[LFCache],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        tp_rank = get_tensor_model_parallel_rank()
         hidden_states = self.embed_tokens(input_ids)
-        # hidden_states = torch.load('../encoder_input.bin')
-        # positions = torch.load('../pos.bin')
-        # attn_metadata.num_prefill_tokens = 8
-        # attn_metadata.num_decode_tokens = 0
-        #rotary_pos_emb = self.rotary_emb(hidden_states, 2056) #self.seq_len)
         rotary_pos_emb = self.rotary_emb(hidden_states, self.seq_len)
         for i, layer in enumerate(self.layers):
             hidden_states = layer(
@@ -680,11 +673,10 @@ class YuanForCausalLM(nn.Module):
         lf_caches: List[LFCache],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        # if attn_metadata.prefill_metadata == None:
-        #     bsz = attn_metadata.num_decode_tokens
-        # else:
-        #     bsz = attn_metadata.num_prefills
-        bsz = 1
+        if attn_metadata.prefill_metadata == None:
+            bsz = attn_metadata.num_decode_tokens
+        else:
+            bsz = attn_metadata.num_prefills
         positions = positions.view(bsz, -1)
         hidden_states = self.model(input_ids, positions, kv_caches, lf_caches, attn_metadata)
         return hidden_states 
