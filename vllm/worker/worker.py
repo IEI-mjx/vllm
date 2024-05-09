@@ -131,7 +131,10 @@ class Worker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        self.model_runner.profile_run()
+        if self.model_config.hf_config.model_type == 'yuan':
+            self.model_runner.profile_run(use_lf_caches=True)
+        else:
+            self.model_runner.profile_run()
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
@@ -179,11 +182,12 @@ class Worker(WorkerBase):
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
                                         self.parallel_config)
         self.gpu_cache = self.cache_engine.gpu_cache
+        self.lf_gpu_cache = self.cache_engine.lf_gpu_cache if self.model_config.hf_config.model_type == 'yuan' else None
         self.model_runner.set_block_size(self.cache_engine.block_size)
 
     def _warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
-            self.model_runner.capture_model(self.gpu_cache)
+            self.model_runner.capture_model(self.gpu_cache, self.lf_gpu_cache)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -238,9 +242,8 @@ class Worker(WorkerBase):
         # If there is no input, we don't need to execute the model.
         if num_seq_groups == 0:
             return []
-
         output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache)
+                                                 self.gpu_cache, self.lf_gpu_cache)
 
         # Worker only supports single-step execution. Wrap the output in a list
         # to conform to interface.
@@ -280,7 +283,6 @@ def init_worker_distributed_environment(
     """Initialize the distributed environment."""
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank)
-
     if pynccl_utils.is_initialized():
         pynccl_world_size = pynccl_utils.get_world_size()
         if pynccl_world_size != parallel_config.world_size:

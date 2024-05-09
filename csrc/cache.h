@@ -28,3 +28,9 @@ void reshape_and_cache(
 void convert_fp8(
   torch::Tensor& src_cache,
   torch::Tensor& dst_cache);
+
+void lf_reshape_and_cache(
+  torch::Tensor& lf1,
+  torch::Tensor& lf2,
+  torch::Tensor& lf1_cache,
+  torch::Tensor& lf2_cache);

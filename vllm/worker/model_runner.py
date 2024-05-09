@@ -38,6 +38,7 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
     _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
 ]
 
+LFCache = Tuple[torch.Tensor, torch.Tensor]
 
 class PreparePromptMetadata(NamedTuple):
     input_tokens: List[int]
@@ -401,7 +402,6 @@ class ModelRunner:
             block_tables=block_tables,
             use_cuda_graph=False,
         )
-
         return PreparePromptMetadata(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -811,6 +811,7 @@ class ModelRunner:
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[torch.Tensor],
+        lf_caches: List[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, attn_metadata, sampling_metadata,
          lora_requests, lora_mapping, multi_modal_input
@@ -833,17 +834,18 @@ class ModelRunner:
             "kv_caches": kv_caches,
             "attn_metadata": attn_metadata,
         }
+        if lf_caches != None:
+            batch_size = attn_metadata.num_prefills + attn_metadata.num_decode_tokens
+            execute_model_kwargs.update({'lf_caches': [(lf1_cache[:batch_size], lf2_cache[:batch_size]) for (lf1_cache, lf2_cache) in lf_caches] if lf_caches[0] != (None, None) else lf_caches})
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
         hidden_states = model_executable(**execute_model_kwargs)
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
-
         # Only perform sampling in the driver worker.
         if not sampling_metadata.perform_sampling:
             return None
-
         # Sample the next token.
         output = self.model.sample(
             logits=logits,
@@ -852,7 +854,7 @@ class ModelRunner:
         return output
 
     @torch.inference_mode()
-    def profile_run(self) -> None:
+    def profile_run(self, use_lf_caches=False) -> None:
         # Enable top-k sampling to reflect the accurate memory usage.
         sampling_params = SamplingParams(top_p=0.99, top_k=self.vocab_size - 1)
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -914,7 +916,9 @@ class ModelRunner:
         # Run the model with the dummy inputs.
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [None] * num_layers
-        self.execute_model(seqs, kv_caches)
+        lf_caches = [(None, None)] * num_layers if use_lf_caches else None
+        
+        self.execute_model(seqs, kv_caches, lf_caches)
         torch.cuda.synchronize()
         return
 
@@ -945,7 +949,7 @@ class ModelRunner:
         return self.lora_manager.list_loras()
 
     @torch.inference_mode()
-    def capture_model(self, kv_caches: List[torch.Tensor]) -> None:
+    def capture_model(self, kv_caches: List[torch.Tensor], lf_caches: List[LFCache] = None) -> None:
         """Cuda graph capture a model.
 
         Note that CUDA graph's performance gain is negligible if number
@@ -1031,13 +1035,23 @@ class ModelRunner:
                     self.set_active_loras(set(), lora_mapping)
 
                 graph_runner = CUDAGraphRunner(self.model)
-                graph_runner.capture(
-                    input_tokens[:batch_size],
-                    input_positions[:batch_size],
-                    kv_caches,
-                    attn_metadata,
-                    memory_pool=self.graph_memory_pool,
-                )
+                if lf_caches != None:
+                    graph_runner.capture(
+                        input_tokens[:batch_size],
+                        input_positions[:batch_size],
+                        kv_caches,
+                        [(lf1_cache[:batch_size], lf2_cache[:batch_size]) for (lf1_cache, lf2_cache) in lf_caches],
+                        attn_metadata,
+                        memory_pool=self.graph_memory_pool,
+                    )
+                else:
+                    graph_runner.capture(
+                        input_tokens[:batch_size],
+                        input_positions[:batch_size],
+                        kv_caches,
+                        attn_metadata,
+                        memory_pool=self.graph_memory_pool,
+                    )
                 self.graph_memory_pool = graph_runner.graph.pool()
                 self.graph_runners[batch_size] = graph_runner
 
@@ -1074,6 +1088,7 @@ class CUDAGraphRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
+        lf_caches: List[LFCache],
         attn_metadata: AttentionMetadata,
         memory_pool,
         **kwargs,
@@ -1083,13 +1098,23 @@ class CUDAGraphRunner:
         # This is to make sure that the captured graph does not include the
         # kernel launches for initial benchmarking (e.g., Triton autotune).
         with _maybe_pynccl():
-            self.model(
-                input_ids,
-                positions,
-                kv_caches,
-                attn_metadata,
-                **kwargs,
-            )
+            if lf_caches == None:
+                self.model(
+                    input_ids,
+                    positions,
+                    kv_caches,
+                    attn_metadata,
+                    **kwargs,
+                )
+            else:
+                self.model(
+                    input_ids,
+                    positions,
+                    kv_caches,
+                    lf_caches,
+                    attn_metadata,
+                    **kwargs,
+                )
         torch.cuda.synchronize()
 
         # Capture the graph.
@@ -1098,13 +1123,23 @@ class CUDAGraphRunner:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph, pool=memory_pool):  # noqa: SIM117
             with _maybe_pynccl():
-                hidden_states = self.model(
-                    input_ids,
-                    positions,
-                    kv_caches,
-                    attn_metadata,
-                    **kwargs,
-                )
+                if lf_caches != None:
+                    hidden_states = self.model(
+                        input_ids,
+                        positions,
+                        kv_caches,
+                        lf_caches,
+                        attn_metadata,
+                        **kwargs,
+                    )
+                else:
+                    hidden_states = self.model(
+                        input_ids,
+                        positions,
+                        kv_caches,
+                        attn_metadata,
+                        **kwargs,
+                    )
         torch.cuda.synchronize()
 
         # Save the input and output buffers.
@@ -1116,6 +1151,8 @@ class CUDAGraphRunner:
             "context_lens": attn_metadata.decode_metadata.context_lens,
             "block_tables": attn_metadata.decode_metadata.block_tables,
         }
+        if lf_caches != None:
+            self.input_buffers.update({"lf_caches": lf_caches})
         self.output_buffers = {"hidden_states": hidden_states}
         return
 
@@ -1124,6 +1161,7 @@ class CUDAGraphRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
+        lf_caches: List[Tuple[torch.Tensor, torch.Tensor]],
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:

@@ -239,7 +239,7 @@ class NCCLCommunicator:
         # don't use these args, as they can be -1
         # use `self.rank`, `self.local_rank` and `self.world_size` instead
         del world_size, rank, local_rank
-        torch.cuda.set_device(self.local_rank)
+        # torch.cuda.set_device(self.local_rank)
         if self.rank == 0:
             self.unique_id = ncclGetUniqueId()
         else:

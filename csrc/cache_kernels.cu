@@ -277,6 +277,33 @@ void reshape_and_cache(
 
 namespace vllm {
 
+template<typename scalar_t>
+__global__ void lf_reshape_and_cache_kernel(
+  const scalar_t* __restrict__ lf1,           // [num_tokens, hidden_size, 1, 1]
+  const scalar_t* __restrict__ lf2,         // [num_tokens, hidden_size//2, 1, 1]
+  scalar_t* __restrict__ lf1_cache,           // [num_blocks, hidden_size, 1, 1]
+  scalar_t* __restrict__ lf2_cache,         // [num_blocks, hidden_size//2, 1, 1]
+  const int lf1_stride,
+  const int lf2_stride,
+  const int hidden_size) {
+  const int64_t token_idx = blockIdx.x;
+
+  const int m = hidden_size;
+  for (int i = threadIdx.x; i < m; i += blockDim.x) {
+    const int64_t src_lf1_idx = token_idx * lf1_stride + i;
+    const int64_t tgt_lf1_idx = token_idx * lf1_stride + i;
+    lf1_cache[tgt_lf1_idx] = lf1[src_lf1_idx];
+  }
+  const int n = hidden_size/2;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int64_t src_lf2_idx = token_idx * lf2_stride + i;
+    const int64_t tgt_lf2_idx = token_idx * lf2_stride + i;
+    lf2_cache[tgt_lf2_idx] = lf2[src_lf2_idx];
+  }
+}
+}
+namespace vllm {
+
 template<typename Tout, typename Tin>
 __global__ void convert_fp8_kernel(
   const Tin* __restrict__ src_cache,
@@ -297,6 +324,36 @@ __global__ void convert_fp8_kernel(
 
 } // namespace vllm
 
+void lf_reshape_and_cache(
+  torch::Tensor& lf1,           // [num_tokens, hidden_size, 1, 1]
+  torch::Tensor& lf2,           // [num_tokens, hidden_size//2, 1, 1]
+  torch::Tensor& lf1_cache,     // [num_blocks, hidden_size, 1, 1]
+  torch::Tensor& lf2_cache)     // [num_blocks, hidden_size//2, 1, 1]
+{
+  int num_tokens = lf1.size(0);
+  int hidden_size = lf1.size(1);
+  int half_hidden_size = lf2.size(1);
+
+  int lf1_stride = lf1.stride(0);
+  int lf2_stride = lf2.stride(0);
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(half_hidden_size, 512));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(
+    lf1.scalar_type(),
+    "lf_reshape_and_cache_kernel",
+    [&] {
+      vllm::lf_reshape_and_cache_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        lf1.data_ptr<scalar_t>(),
+        lf2.data_ptr<scalar_t>(),
+        lf1_cache.data_ptr<scalar_t>(),
+        lf2_cache.data_ptr<scalar_t>(),
+        lf1_stride,
+        lf2_stride,
+        hidden_size);
+    });
+}
 #define CALL_CONVERT_FP8(Tout, Tin)                                 \
   vllm::convert_fp8_kernel<Tout, Tin><<<grid, block, 0, stream>>>(  \
     reinterpret_cast<Tin*>(src_cache.data_ptr()),                   \

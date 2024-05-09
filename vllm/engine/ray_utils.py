@@ -65,7 +65,7 @@ try:
             """Used only when compiled DAG is enabled."""
             import torch
             if not self.compiled_dag_cuda_device_set:
-                torch.cuda.set_device(self.worker.device)
+                #torch.cuda.set_device(self.worker.device)
                 self.compiled_dag_cuda_device_set = True
 
             output = self.worker.execute_model()
@@ -138,6 +138,7 @@ def initialize_ray_cluster(
                 "available GPUs in the cluster.")
         # Create a new placement group
         placement_group_specs = ([{"GPU": 1}] * parallel_config.world_size)
+        #placement_group_specs = ([{"GPU": parallel_config.world_size)
         current_placement_group = ray.util.placement_group(
             placement_group_specs)
         # Wait until PG is ready - this will block until all

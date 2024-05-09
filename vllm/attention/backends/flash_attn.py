@@ -181,7 +181,6 @@ class FlashAttentionImpl(AttentionImpl):
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
-
         if kv_cache is not None:
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
@@ -197,8 +196,8 @@ class FlashAttentionImpl(AttentionImpl):
 
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
-        assert key.shape[0] == num_prefill_tokens + num_decode_tokens
-        assert value.shape[0] == num_prefill_tokens + num_decode_tokens
+        assert key.shape[0] == num_prefill_tokens + num_decode_tokens, f"{key.shape[0]}, {num_prefill_tokens}, {num_decode_tokens}"
+        assert value.shape[0] == num_prefill_tokens + num_decode_tokens, f"{key.shape[0]}, {num_prefill_tokens}, {num_decode_tokens}"
 
         output = torch.empty_like(query)
         # Query for decode. KV is not needed because it is already cached.

@@ -81,7 +81,6 @@ class RayGPUExecutor(ExecutorBase):
         if self.parallel_config.ray_workers_use_nsight:
             ray_remote_kwargs = self._configure_ray_workers_use_nsight(
                 ray_remote_kwargs)
-
         # Create the workers.
         driver_ip = get_ip()
         for bundle_id, bundle in enumerate(placement_group.bundle_specs):
@@ -133,7 +132,7 @@ class RayGPUExecutor(ExecutorBase):
             node_gpus[node_id] = sorted(gpu_ids)
 
         # Set CUDA_VISIBLE_DEVICES for the driver and workers.
-        set_cuda_visible_devices(node_gpus[driver_node_id])
+        #set_cuda_visible_devices(node_gpus[driver_node_id])
         for worker, (node_id, _) in zip(self.workers, worker_node_and_gpu_ids):
             worker.set_cuda_visible_devices.remote(node_gpus[node_id])
 
@@ -167,13 +166,12 @@ class RayGPUExecutor(ExecutorBase):
                     device_config=device_config,
                     cache_config=cache_config,
                     load_config=load_config,
-                    local_rank=local_rank,
+                    local_rank=0, #local_rank,
                     rank=rank,
                     distributed_init_method=distributed_init_method,
                     lora_config=lora_config,
                     vision_language_config=vision_language_config,
                 ))
-
         # Initialize the driver worker with the Worker class.
         driver_rank = 0
         driver_local_rank = node_workers[driver_node_id].index(driver_rank)
@@ -191,7 +189,6 @@ class RayGPUExecutor(ExecutorBase):
             load_config=self.load_config,
             is_driver_worker=True,
         )
-
         self._run_workers("init_device")
         self._run_workers(
             "load_model",
@@ -290,7 +287,6 @@ class RayGPUExecutor(ExecutorBase):
         if max_concurrent_workers:
             raise NotImplementedError(
                 "max_concurrent_workers is not supported yet.")
-
         if use_ray_compiled_dag:
             # Right now, compiled DAG can only accept a single
             # input. TODO(sang): Fix it.
@@ -302,7 +298,6 @@ class RayGPUExecutor(ExecutorBase):
                 worker.execute_method.remote(method, *args, **kwargs)
                 for worker in self.workers
             ]
-
         if driver_args is None:
             driver_args = args
         if driver_kwargs is None:

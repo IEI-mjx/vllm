@@ -7,11 +7,11 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.utils import is_hip
-
+from transformers.activations import ACT2FN
+import torch.nn.functional as F
 logger = init_logger(__name__)
 
 
@@ -218,7 +218,6 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
 
     grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META[
         'BLOCK_SIZE_M']) * triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
-
     fused_moe_kernel[grid](
         A,
         B,
@@ -243,7 +242,6 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         compute_type=tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16,
         **config,
     )
-
 
 def get_config_file_name(E: int, N: int) -> str:
     device_name = torch.cuda.get_device_name().replace(" ", "_")
@@ -278,6 +276,10 @@ def get_moe_configs(E: int, N: int) -> Optional[Dict[int, Any]]:
     # configuration
     return None
 
+def glu(x):
+    x = torch.chunk(x, 2, dim=-1)
+    return F.silu(x[0]) * x[1]
+
 
 def fused_moe(
     hidden_states: torch.Tensor,
@@ -288,6 +290,9 @@ def fused_moe(
     renormalize: bool,
     inplace: bool = False,
     override_config: Optional[Dict[str, Any]] = None,
+    no_moe_kernels: bool = False,
+    topk_before_softmax: bool = False,
+    model_type: str = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -311,7 +316,7 @@ def fused_moe(
     """
     # Check constraints.
     assert hidden_states.shape[0] == gating_output.shape[0], (
-        "Number of tokens mismatch")
+        f"Number of tokens mismatch, {hidden_states.shape}, {gating_output.shape}")
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -320,15 +325,24 @@ def fused_moe(
     assert hidden_states.dtype in [
         torch.float32, torch.float16, torch.bfloat16
     ]
+    # M: tokens, b*s
+    # E: experts
+    # N: 2*hidden_size
     M, _ = hidden_states.shape
     E, N, _ = w1.shape
 
-    if is_hip():
+    if is_hip() or no_moe_kernels:
         # The MoE kernels are not yet supported on ROCm.
-        routing_weights = torch.softmax(gating_output,
-                                        dim=-1,
-                                        dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(routing_weights, topk, dim=-1)
+        if topk_before_softmax:
+            top_logits, topk_ids = torch.topk(gating_output, topk, dim=-1)
+            topk_weights = torch.softmax(top_logits,
+                                            dim=-1,
+                                            dtype=torch.float32)
+        else:
+            routing_weights = torch.softmax(gating_output,
+                                            dim=-1,
+                                            dtype=torch.float32)
+            topk_weights, topk_ids = torch.topk(routing_weights, topk, dim=-1)
     else:
         import vllm._moe_C as moe_kernels
 
@@ -390,22 +404,23 @@ def fused_moe(
     intermediate_cache3 = torch.empty((M, topk_ids.shape[1], w2.shape[1]),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
-
+    
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config['BLOCK_SIZE_M'], E)
-
     invoke_fused_moe_kernel(hidden_states, w1, intermediate_cache1,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, False,
                             topk_ids.shape[1], config)
-
-    ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
-
+    if model_type != 'yuan':
+        ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+    else:
+        intermediate_cache2 = glu(intermediate_cache1.view(-1, N))
+    
     invoke_fused_moe_kernel(intermediate_cache2, w2, intermediate_cache3,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, True, 1,
                             config)
-
+    
     if inplace:
         return torch.sum(intermediate_cache3.view(*intermediate_cache3.shape),
                          dim=1,
