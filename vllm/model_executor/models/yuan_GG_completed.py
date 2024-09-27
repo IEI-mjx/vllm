@@ -77,6 +77,7 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_group
 import grouped_gemm as gg
 from vllm.engine.async_llm_engine import AsyncLLMEngine, _AsyncLLMEngine # for api_server
 from vllm.outputs import EmbeddingRequestOutput, RequestOutput # for api_server
+import grouped_gemm as gg
 
 # LFCache = Tuple[torch.Tensor, torch.Tensor]
 ### add lf1_caches and lf2_caches in SequenceData for Yuan model
