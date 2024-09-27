@@ -27,7 +27,7 @@ import json
 import os
 from urllib import request
 import pdb
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import copy
 import math
 import numpy as np
@@ -75,6 +75,9 @@ from vllm.sequence import SequenceData
 from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.distributed.parallel_state import get_tensor_model_parallel_group
 import grouped_gemm as gg
+from vllm.engine.async_llm_engine import AsyncLLMEngine, _AsyncLLMEngine # for api_server
+from vllm.outputs import EmbeddingRequestOutput, RequestOutput # for api_server
+
 # LFCache = Tuple[torch.Tensor, torch.Tensor]
 ### add lf1_caches and lf2_caches in SequenceData for Yuan model
 setattr(SequenceData, "lf1_caches", [])
@@ -110,9 +113,56 @@ class YuanLLMEngine(LLMEngine):
         else:
             output = []
         return self._process_model_outputs(output, scheduler_outputs.scheduled_seq_groups, scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
+# api_server use
+class YuanAsyncLLMEngine(LLMEngine):
+    async def step_async(
+        self, virtual_engine: int
+    ) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
+        seq_group_metadata_list, scheduler_outputs = self.scheduler[
+            virtual_engine].schedule()
+
+        global global_seq_list
+        # each step needs to be cleared
+        global_seq_list.clear()
+        for seq_group_metadata in seq_group_metadata_list:
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            for seq_id in seq_ids:
+                seq_data = seq_group_metadata.seq_data[seq_id]
+                global_seq_list.append(seq_data)
+
+        if not scheduler_outputs.is_empty():
+            # Execute the model.
+            finished_requests_ids = self.scheduler[
+                virtual_engine].get_and_reset_finished_requests_ids()
+            execute_model_req = ExecuteModelRequest(
+                seq_group_metadata_list=seq_group_metadata_list,
+                blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
+                blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
+                blocks_to_copy=scheduler_outputs.blocks_to_copy,
+                virtual_engine=virtual_engine,
+                num_lookahead_slots=scheduler_outputs.num_lookahead_slots,
+                running_queue_size=scheduler_outputs.running_queue_size,
+                finished_requests_ids=finished_requests_ids)
+            output = await self.model_executor.execute_model_async(
+                execute_model_req)
+        else:
+            output = []
+
+        request_outputs = self._process_model_outputs(
+            output, scheduler_outputs.scheduled_seq_groups,
+            scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
+
+        # Log stats.
+        self.do_log_stats(scheduler_outputs, output)
+
+        # Tracing
+        self.do_tracing(scheduler_outputs)
+
+        return request_outputs
 
 # hijack LLMEngine.step with YuanLLMEngine.step, use record global_seq_list
 LLMEngine.step = YuanLLMEngine.step
+_AsyncLLMEngine.step_async = YuanAsyncLLMEngine.step_async # api_server use
 
 logger = init_logger(__name__)
 LFCache_type = List[torch.Tensor]
