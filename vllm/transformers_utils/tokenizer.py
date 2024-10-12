@@ -61,6 +61,7 @@ def get_tokenizer(
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     download_dir: Optional[str] = None,
+    model_type: str = None,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via HuggingFace or ModelScope.
